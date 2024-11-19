@@ -271,6 +271,75 @@ class Attention(Module):
         out = rearrange(out, 'b h (x y) d -> b (h d) x y', x = h, y = w)
         return self.to_out(out)
 
+
+# https://github.com/microsoft/unilm/blob/master/Diff-Transformer/multihead_diffattn.py
+def lambda_init_fn(depth):
+    """Initialize lambda scaling factor based on depth."""
+    return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+class DifferentialAttention(nn.Module):
+    def __init__(
+        self,
+        dim,
+        heads=4,
+        dim_head=32,
+        num_mem_kv=4,
+        depth=0, # TODO: fix this depth param so that it can be learned
+        flash=False
+    ):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = dim_head
+        self.scale = 1 / math.sqrt(dim_head)
+        self.lambda_init = lambda_init_fn(depth)
+
+        hidden_dim = dim_head * heads
+
+        self.norm = RMSNorm(dim)
+        self.attend = Attend(flash=flash)
+
+        self.mem_kv = nn.Parameter(torch.randn(2, heads, num_mem_kv, dim_head))
+
+        self.q1_proj = nn.Conv2d(dim, hidden_dim, 1, bias=False)
+        self.k1_proj = nn.Conv2d(dim, hidden_dim, 1, bias=False)
+        self.q2_proj = nn.Conv2d(dim, hidden_dim, 1, bias=False)
+        self.k2_proj = nn.Conv2d(dim, hidden_dim, 1, bias=False)
+        self.v_proj = nn.Conv2d(dim, hidden_dim, 1, bias=False)
+        
+        self.to_out = nn.Conv2d(hidden_dim, dim, 1)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+
+        x = self.norm(x)
+
+        q1 = self.q1_proj(x) # [batch_size, heads * dim_head, height, width]
+        k1 = self.k1_proj(x)
+        q2 = self.q2_proj(x)
+        k2 = self.k2_proj(x)
+        v = self.v_proj(x)
+
+        q1 = rearrange(q1, 'b (h d) x y -> b h (x y) d', h=self.heads)
+        k1 = rearrange(k1, 'b (h d) x y -> b h (x y) d', h=self.heads)
+        q2 = rearrange(q2, 'b (h d) x y -> b h (x y) d', h=self.heads)
+        k2 = rearrange(k2, 'b (h d) x y -> b h (x y) d', h=self.heads)
+        v = rearrange(v, 'b (h d) x y -> b h (x y) d', h=self.heads)
+
+        mk, mv = map(lambda t: repeat(t, 'h n d -> b h n d', b=b), self.mem_kv)
+        k1 = torch.cat((mk, k1), dim=-2)
+        k2 = torch.cat((mk, k2), dim=-2)
+        v = torch.cat((mv, v), dim=-2)
+
+        A1 = (q1 @ k1.transpose(-1, -2)) * self.scale
+        A2 = (q2 @ k2.transpose(-1, -2)) * self.scale
+        attn1 = F.softmax(A1, dim=-1)
+        attn2 = F.softmax(A2, dim=-1)
+
+        output = (attn1 - self.lambda_init * attn2) @ v
+        out = rearrange(output, 'b h (x y) d -> b (h d) x y', x=h, y=w)
+        return self.to_out(out)
+
+
 # model
 
 class Unet(Module):
@@ -291,9 +360,12 @@ class Unet(Module):
         attn_dim_head = 32,
         attn_heads = 4,
         full_attn = None,    # defaults to full attention only for inner most layer
-        flash_attn = False
+        flash_attn = False,
+        differential_transformer=False,
     ):
         super().__init__()
+
+        self.differential_transformer = differential_transformer
 
         # determine dimensions
 
@@ -341,7 +413,8 @@ class Unet(Module):
 
         # prepare blocks
 
-        FullAttention = partial(Attention, flash = flash_attn)
+        # FullAttention = partial(Attention, flash = flash_attn)
+        FullAttention = partial(DifferentialAttention, flash=flash_attn) if differential_transformer else partial(Attention, flash=flash_attn)
         resnet_block = partial(ResnetBlock, time_emb_dim = time_dim, dropout = dropout)
 
         # layers
